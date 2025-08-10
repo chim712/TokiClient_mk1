@@ -5,6 +5,8 @@ import pyaudio
 import webrtcvad
 from datetime import datetime
 import whisper  # Whisper STT 라이브러리 임포트
+import struct  # 바이트 데이터를 숫자로 변환하기 위해 추가
+import math  # RMS 계산에 필요한 수학 함수를 위해 추가
 
 
 class STTProcessor:
@@ -19,7 +21,8 @@ class STTProcessor:
     4. FFmpeg: 시스템 PATH에 설치되어 있어야 함 (Whisper가 내부적으로 사용).
     """
 
-    def __init__(self, aggressiveness=2, sample_rate=16000, frame_duration=30, whisper_model_name="base"):
+    def __init__(self, aggressiveness=2, sample_rate=16000, frame_duration=30, whisper_model_name="base",
+                 noise_threshold_db=-40):
         """
         STTProcessor를 초기화합니다.
 
@@ -31,6 +34,9 @@ class STTProcessor:
                                   webrtcvad는 10, 20, 30ms 프레임만 지원합니다.
             whisper_model_name (str): 사용할 Whisper 모델 이름 (예: "tiny", "base", "small", "medium", "large").
                                       모델 크기가 클수록 정확도는 높지만 로드 시간과 메모리 사용량이 증가합니다.
+            noise_threshold_db (int): 마이크 입력의 노이즈 기준값 (dBFS).
+                                      이 값보다 낮은 데시벨의 오디오는 음성이 아닌 노이즈로 간주됩니다.
+                                      기본값 -40dBFS는 일반적인 환경에서 시작하기에 좋습니다.
         """
         # webrtcvad 초기화
         self.vad = webrtcvad.Vad(aggressiveness)
@@ -45,6 +51,11 @@ class STTProcessor:
         # 오디오 스트림을 관리하기 위한 PyAudio 인스턴스입니다.
         self.audio = pyaudio.PyAudio()
         self.stream = None  # 오디오 입력 스트림 객체
+
+        # 노이즈 기준값 설정 (dBFS: dB Full Scale)
+        # 16비트 PCM에서 0dBFS는 최대 음량입니다. 값은 음수입니다.
+        # 이 값보다 낮은 음량은 노이즈로 간주됩니다.
+        self.noise_threshold_db = noise_threshold_db
 
         # Whisper 모델 로드 (초기화 시 한 번만 로드하여 효율성 증대)
         self.log(f"Whisper 모델 '{whisper_model_name}' 로드 중... 이 작업은 시간이 다소 소요될 수 있습니다.")
@@ -127,6 +138,51 @@ class STTProcessor:
             except Exception as e:
                 self.log(f"임시 파일 삭제 중 오류 발생: {e}")
 
+    def _get_frame_rms_db(self, frame_bytes):
+        """
+        오디오 프레임의 RMS (Root Mean Square) 에너지를 dBFS (decibels Full Scale)로 계산합니다.
+        16비트 부호 있는 PCM 오디오를 가정합니다.
+
+        Args:
+            frame_bytes (bytes): 오디오 프레임의 바이트 데이터.
+
+        Returns:
+            float: 해당 프레임의 RMS 레벨 (dBFS).
+                   음량이 전혀 없는 경우 -inf를 반환합니다.
+        """
+        # 바이트 데이터를 16비트 부호 있는 정수 배열로 변환
+        # 'h'는 short (2바이트), little-endian을 가정합니다 (PyAudio 기본값).
+        # len(frame_bytes) // 2는 정수 샘플의 수입니다.
+        try:
+            samples = struct.unpack(f'{len(frame_bytes) // 2}h', frame_bytes)
+        except struct.error as e:
+            self.log(f"오디오 프레임 언팩 중 오류 발생: {e}. 프레임 크기를 확인하세요.")
+            return -float('inf')  # 오류 발생 시 매우 낮은 dB 값 반환
+
+        # 각 샘플 값의 제곱의 합 계산
+        sum_squares = sum(s ** 2 for s in samples)
+
+        # 샘플 수가 0이 아닌지 확인하여 ZeroDivisionError 방지
+        if not samples:
+            return -float('inf')
+
+        # 제곱 평균 (Mean Square) 계산
+        mean_square = sum_squares / len(samples)
+
+        # RMS (Root Mean Square) 계산
+        rms = math.sqrt(mean_square)
+
+        # 16비트 부호 있는 오디오의 최대 진폭 (2^15 - 1)
+        max_amplitude = 32767.0
+
+        # 로그 함수의 정의상 0으로 나누거나 log(0)을 피하기 위해 처리
+        if rms == 0:
+            return -96.0  # 16비트 오디오의 이론적 최소 노이즈 플로어 (~-96dBFS) 또는 -inf
+
+        # RMS를 dBFS로 변환: 20 * log10(RMS / 최대 진폭)
+        dbfs = 20 * math.log10(rms / max_amplitude)
+        return dbfs
+
     def transcribe_from_mic(self):
         """
         마이크로부터 음성을 녹음하고, 음성 활동을 감지합니다.
@@ -147,6 +203,7 @@ class STTProcessor:
         # 오디오 스트림 시작
         self._start_stream()
         self.log("[STT 대기 중] 마이크에 음성을 말씀해주세요...")
+        self.log(f"설정된 노이즈 기준값: {self.noise_threshold_db} dBFS")
 
         voiced_frames = []  # 음성 또는 음성 후 무음 프레임을 저장할 리스트
         silence_start_time = None  # 무음이 시작된 시간 (타이머)
@@ -167,8 +224,16 @@ class STTProcessor:
                     self.log("오디오 프레임 크기 부족 또는 스트림 비정상 종료 감지. 녹음 중단.")
                     break
 
-                # webrtcvad를 사용하여 현재 프레임에 음성이 있는지 확인
-                is_speech = self.vad.is_speech(frame, self.sample_rate)
+                # 현재 프레임의 RMS 데시벨 값 계산
+                frame_rms_db = self._get_frame_rms_db(frame)
+
+                # webrtcvad를 사용하여 현재 프레임에 음성이 있는지 1차 판단
+                vad_is_speech = self.vad.is_speech(frame, self.sample_rate)
+
+                # 최종 is_speech 판별:
+                # webrtcvad가 음성으로 판단했고 AND 프레임의 음량(RMS)이 노이즈 기준값보다 높을 때만 음성으로 간주
+                # 이렇게 하면 낮은 레벨의 잡음은 음성으로 처리되지 않습니다.
+                is_speech = vad_is_speech and (frame_rms_db > self.noise_threshold_db)
 
                 if is_speech:
                     # 음성이 감지됨
@@ -181,7 +246,7 @@ class STTProcessor:
                     voiced_frames.append(frame)  # 현재 프레임을 녹음 데이터에 추가
                     silence_start_time = None  # 음성이 감지되었으니 무음 타이머 초기화
                 else:
-                    # 무음이 감지됨
+                    # 무음이 감지됨 (또는 노이즈 기준값 이하의 소리)
                     if recording_active:
                         # 녹음이 이미 활성화된 상태에서 무음이 감지된 경우 (말하다가 멈춘 경우)
                         if silence_start_time is None:
@@ -189,8 +254,8 @@ class STTProcessor:
                             silence_start_time = time.time()
 
                         # 무음이 3초 이상 지속되었는지 확인
-                        if time.time() - silence_start_time > 2.0:
-                            self.log("[무음 감지] ?초 이상 무음 지속. 녹음 종료.")
+                        if time.time() - silence_start_time > 3.0:
+                            self.log("[무음 감지] 3초 이상 무음 지속. 녹음 종료.")
                             break  # 3초 무음 조건 충족, 녹음 루프 종료
 
                         # 무음 프레임도 녹음 데이터에 포함 (음성 끝부분이 잘리지 않도록)
@@ -225,7 +290,7 @@ class STTProcessor:
                         self.log(f"Whisper를 사용하여 '{temp_wav_path}' 파일 전사(Transcribe) 시작...")
                         # Whisper 모델의 transcribe 함수는 오디오 파일 경로를 직접 처리합니다.
                         # fp16=False는 CPU 사용 시 메모리 사용량과 성능의 균형을 맞추는 데 도움이 됩니다.
-                        result = self.whisper_model.transcribe(temp_wav_path, fp16=False, language="ko")
+                        result = self.whisper_model.transcribe(temp_wav_path, fp16=False)
                         transcribed_text = result["text"]  # 결과에서 텍스트 추출
                         self.log(f"[STT 결과] '{transcribed_text}'")
                     except Exception as e:
@@ -248,7 +313,9 @@ if __name__ == "__main__":
     # STTProcessor 인스턴스 생성
     # aggressiveness는 VAD의 민감도를 조절합니다 (0: 낮음 ~ 3: 높음).
     # "base" 모델은 대부분의 경우 좋은 정확도와 속도 균형을 제공합니다.
-    stt_handler = STTProcessor(aggressiveness=2, whisper_model_name="base")
+    # noise_threshold_db는 마이크가 잡음을 음성으로 오인하지 않도록 합니다.
+    # 이 값을 조절하여 환경에 맞는 최적의 값을 찾으세요. (예: -50, -45, -35 등)
+    stt_handler = STTProcessor(aggressiveness=2, whisper_model_name="base", noise_threshold_db=-40)
 
     # 진입 함수 호출
     final_text = stt_handler.transcribe_from_mic()
